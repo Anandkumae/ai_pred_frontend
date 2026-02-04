@@ -17,13 +17,13 @@ import os
 # Configuration
 # Use environment variable for API URL, fallback to localhost for local development
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
-REFRESH_INTERVAL = 30  # seconds
-LOG_FILE = "logs/prediction_logs.csv"
-ALERT_LOG_FILE = "logs/alert_history.csv"
+REFRESH_INTERVAL = 5  # seconds - faster refresh for real-time updates
+LOG_FILE = os.path.join("..", "backend", "logs", "prediction_logs.csv")  # Point to backend logs
+ALERT_LOG_FILE = os.path.join("..", "backend", "logs", "alert_history.csv")  # Point to backend logs
 
 # Page configuration
 st.set_page_config(
-    page_title="AI Model Health Dashboard",
+    page_title="ML Failure Prediction - Health Monitoring",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -128,23 +128,74 @@ def create_gauge_chart(value, title, max_value=1.0):
 # Main Dashboard
 def main():
     # Header
-    st.title("🤖 AI Model Health Monitoring Dashboard")
+    st.title("🤖 ML Failure Prediction - Health Monitoring Dashboard")
+    st.caption("AI-Driven Framework for Predicting Model Failures Before Deployment or Retraining")
     st.markdown("---")
     
     # Fetch data
     failure_risk = get_failure_risk()
     drift_status = get_drift_status()
     
-    if failure_risk and "error" not in failure_risk:
-        failure_prob = failure_risk.get("failure_probability", 0)
-        risk_level = failure_risk.get("risk", "UNKNOWN")
-        metrics = failure_risk.get("metrics", {})
+    # Load logs for fallback calculations
+    df_logs = load_prediction_logs()
+    
+    # Calculate metrics from logs if API returns insufficient data
+    if not df_logs.empty:
+        # Calculate basic metrics from logs
+        avg_confidence_from_logs = float(df_logs['confidence'].mean())
+        avg_latency_from_logs = float(df_logs['latency'].mean())
+        total_predictions = len(df_logs)
         
+        # Calculate concept drift count
+        concept_drift_count_from_logs = 0
+        if 'concept_drift' in df_logs.columns:
+            concept_drift_count_from_logs = int(df_logs['concept_drift'].sum())
+        
+        # Use API data if available, otherwise use log data
+        if failure_risk and "error" not in failure_risk and failure_risk.get("predictions_analyzed", 0) > 0:
+            failure_prob = failure_risk.get("failure_probability", 0)
+            risk_level = failure_risk.get("risk", "UNKNOWN")
+            metrics = failure_risk.get("metrics", {})
+        else:
+            # Fallback: calculate from logs
+            failure_prob = 0.0
+            risk_level = "INSUFFICIENT_DATA"
+            metrics = {
+                'avg_confidence': avg_confidence_from_logs,
+                'psi_score': 0.0,
+                'latency': avg_latency_from_logs,
+                'concept_drift_count': concept_drift_count_from_logs,
+                'error_trend': 0.0
+            }
+            failure_risk = {
+                'failure_probability': failure_prob,
+                'risk': risk_level,
+                'metrics': metrics,
+                'predictions_analyzed': total_predictions
+            }
+    else:
+        # No data at all
+        if failure_risk and "error" not in failure_risk:
+            failure_prob = failure_risk.get("failure_probability", 0)
+            risk_level = failure_risk.get("risk", "UNKNOWN")
+            metrics = failure_risk.get("metrics", {})
+        else:
+            failure_prob = 0
+            risk_level = "NO_DATA"
+            metrics = {}
+    
+    if failure_risk and "error" not in failure_risk:
         # Status Badge
         status_text, status_class = get_status_badge(failure_prob)
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
-            st.markdown(f'<p class="{status_class}">{status_text}</p>', unsafe_allow_html=True)
+            if risk_level == "INSUFFICIENT_DATA":
+                st.info(f"📊 Collecting Data - {failure_risk.get('predictions_analyzed', 0)} predictions so far")
+                st.caption("Need 10+ predictions for full failure risk analysis")
+            elif risk_level == "NO_DATA":
+                st.warning("⚠️ No predictions yet - Make some predictions to see metrics!")
+            else:
+                st.markdown(f'<p class="{status_class}">{status_text}</p>', unsafe_allow_html=True)
             st.caption(f"Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         st.markdown("---")
@@ -180,6 +231,99 @@ def main():
                 value=f"{metrics.get('concept_drift_count', 0)}",
                 delta="Detected" if metrics.get('concept_drift_count', 0) > 0 else "None"
             )
+        
+        st.markdown("---")
+        
+        # Additional Detailed Metrics
+        st.subheader("📊 Detailed Performance Metrics")
+        
+        col_m1, col_m2, col_m3 = st.columns(3)
+        
+        with col_m1:
+            st.metric(
+                label="Avg Latency",
+                value=f"{metrics.get('latency', 0)*1000:.2f} ms",
+                help="Average prediction latency"
+            )
+        
+        with col_m2:
+            st.metric(
+                label="Error Trend",
+                value=f"{metrics.get('error_trend', 0):.4f}",
+                delta="Increasing" if metrics.get('error_trend', 0) > 0 else "Stable",
+                delta_color="inverse",
+                help="Slope of error over time"
+            )
+        
+        with col_m3:
+            st.metric(
+                label="Predictions Analyzed",
+                value=f"{failure_risk.get('predictions_analyzed', 0)}",
+                help="Number of recent predictions analyzed"
+            )
+        
+        # Drift Detection Details
+        if drift_status and "error" not in drift_status:
+            st.markdown("---")
+            st.subheader("🔍 Drift Detection Details")
+            
+            drift_features = drift_status.get("drift_detection", {}).get("features", {})
+            
+            col_d1, col_d2, col_d3 = st.columns(3)
+            
+            for idx, (feature_name, feature_data) in enumerate(drift_features.items()):
+                col = [col_d1, col_d2, col_d3][idx % 3]
+                with col:
+                    psi_score = feature_data.get("psi_score", 0)
+                    status = feature_data.get("status", "UNKNOWN")
+                    
+                    delta_color = "off" if status == "OK" else "inverse"
+                    st.metric(
+                        label=f"{feature_name.replace('_', ' ').title()}",
+                        value=f"PSI: {psi_score:.4f}",
+                        delta=status,
+                        delta_color=delta_color
+                    )
+        
+        # Model-Specific Performance (if logs available)
+        df_logs = load_prediction_logs()
+        if not df_logs.empty and 'model_type' in df_logs.columns:
+            st.markdown("---")
+            st.subheader("⚖️ Model-Specific Performance")
+            
+            # Calculate stats by model type
+            good_logs = df_logs[df_logs['model_type'] == 'good']
+            bad_logs = df_logs[df_logs['model_type'] == 'bad']
+            
+            col_model1, col_model2 = st.columns(2)
+            
+            with col_model1:
+                st.markdown("**🟢 Good Model Stats**")
+                if not good_logs.empty:
+                    col_g1, col_g2 = st.columns(2)
+                    with col_g1:
+                        st.metric("Avg Confidence", f"{good_logs['confidence'].mean():.2%}")
+                        st.metric("Predictions", len(good_logs))
+                    with col_g2:
+                        st.metric("Avg Latency", f"{good_logs['latency'].mean()*1000:.2f} ms")
+                        if 'concept_drift' in good_logs.columns:
+                            st.metric("Drift Count", int(good_logs['concept_drift'].sum()))
+                else:
+                    st.info("No predictions yet")
+            
+            with col_model2:
+                st.markdown("**🔴 Bad Model Stats**")
+                if not bad_logs.empty:
+                    col_b1, col_b2 = st.columns(2)
+                    with col_b1:
+                        st.metric("Avg Confidence", f"{bad_logs['confidence'].mean():.2%}")
+                        st.metric("Predictions", len(bad_logs))
+                    with col_b2:
+                        st.metric("Avg Latency", f"{bad_logs['latency'].mean()*1000:.2f} ms")
+                        if 'concept_drift' in bad_logs.columns:
+                            st.metric("Drift Count", int(bad_logs['concept_drift'].sum()))
+                else:
+                    st.info("No predictions yet")
         
         st.markdown("---")
         
